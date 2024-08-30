@@ -1,65 +1,61 @@
 import { NextRequest, NextResponse } from 'next/server';
-import formidable, { File } from 'formidable';
-import fs from 'fs';
 import { createWorker } from 'tesseract.js';
-import { MongoClient } from 'mongodb';
-
-export const config = {
-  api: {
-    bodyParser: false,
-  },
-};
+import { MongoClient, ObjectId } from 'mongodb';
+import { writeFile, unlink } from 'fs/promises';
+import path from 'path';
+import os from 'os';
 
 export async function POST(req: NextRequest) {
-  const form = new formidable.IncomingForm({
-    keepExtensions: true, // Keep file extensions
-    uploadDir: './public/uploads', // Directory to save uploaded files
-  });
+  try {
+    const formData = await req.formData();
+    const file = formData.get('file') as File | null;
 
-  return new Promise((resolve, reject) => {
-    form.parse(req as any, async (err, fields, files) => {
-      if (err) {
-        return resolve(
-          NextResponse.json({ message: 'Error parsing form data' }, { status: 500 })
-        );
-      }
+    if (!file) {
+      return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
+    }
 
-      const file = files.file as formidable.File | undefined;
-      if (!file) {
-        return resolve(
-          NextResponse.json({ message: 'No file uploaded' }, { status: 400 })
-        );
-      }
+    // Create a temporary file
+    const tempDir = os.tmpdir();
+    const tempFilePath = path.join(tempDir, `receipt-${Date.now()}.png`);
+    const bytes = await file.arrayBuffer();
+    const buffer = Buffer.from(bytes);
 
-      const filePath = file.filepath;
+    // Write the file to the temporary directory
+    await writeFile(tempFilePath, buffer);
 
-      try {
-        // Perform OCR
-        const worker = await createWorker('eng');
-        const { data: { text } } = await worker.recognize(filePath);
-        await worker.terminate();
+    // Perform OCR
+    const worker = await createWorker('eng');
+    const { data: { text } } = await worker.recognize(tempFilePath);
+    await worker.terminate();
 
-        // Process extracted text
-        const lines = text.split('\n');
-        const extractedData = lines.map(line => {
-          const [date, merchant] = line.split(',');
-          return { date: date?.trim() || '', merchant: merchant?.trim() || '' };
-        });
+    // Remove the temporary file
+    await unlink(tempFilePath);
 
-        // Save to MongoDB
-        const client = await MongoClient.connect(process.env.MONGODB_URI as string);
-        const db = client.db('receipts');
-        await db.collection('extracted_data').insertMany(extractedData);
-        await client.close();
-
-        resolve(NextResponse.json(extractedData, { status: 200 }));
-      } catch (error) {
-        console.error('Error processing image:', error);
-        resolve(NextResponse.json({ message: 'Error processing image' }, { status: 500 }));
-      } finally {
-        // Clean up the temporary file
-        fs.unlinkSync(filePath);
-      }
+    // Process extracted text (simplified example)
+    const lines = text.split('\n');
+    const extractedData = lines.map(line => {
+      const [date, description, amount] = line.split(',');
+      return { date: date?.trim(), description: description?.trim(), amount: amount?.trim() };
     });
-  });
+    console.log(extractedData);
+
+    // Save to MongoDB
+    const mongoUri = process.env.MONGODB_URI;
+    if (!mongoUri) {
+      throw new Error('MongoDB URI is not defined in environment variables');
+    }
+
+    const client = await MongoClient.connect(mongoUri);
+    const db = client.db('receipts');
+    const result = await db.collection('processed_receipts').insertOne({
+      data: extractedData,
+      createdAt: new Date()
+    });
+    await client.close();
+
+    return NextResponse.json({ extractedData }, { status: 200 });
+  } catch (error) {
+    console.error('Error processing image:', error);
+    return NextResponse.json({ error: 'Error processing image' }, { status: 500 });
+  }
 }
